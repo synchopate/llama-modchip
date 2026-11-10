@@ -11,6 +11,10 @@ autonomous coding agents (e.g. Claude Code).
 
 Usage:
     python3 scripts/check_cpu_readiness.py [--json] [--no-bench]
+
+Windows (PowerShell) — run from a file so the benchmark workers can be spawned:
+    curl.exe -sLo check_cpu_readiness.py https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py
+    python check_cpu_readiness.py
 """
 
 import argparse
@@ -23,6 +27,7 @@ import multiprocessing
 import os
 import platform
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -208,6 +213,249 @@ def parse_size_to_mb(val_str):
     return num / (1024.0 * 1024.0)
 
 
+# ----------------------------------------------------------------------------
+# Native Windows detection (ctypes + winreg, standard library only).
+# /proc, /sys and lscpu do not exist on Windows, so without this every field
+# falls back to zero (0 GB RAM, 0 MB L3, no SIMD flags) and the verdict is wrong.
+# ----------------------------------------------------------------------------
+
+_WIN_RELATION_PROCESSOR_CORE = 0
+_WIN_RELATION_NUMA_NODE = 1
+_WIN_RELATION_CACHE = 2
+_WIN_RELATION_PROCESSOR_PACKAGE = 3
+_WIN_RELATION_ALL = 0xFFFF
+
+# IsProcessorFeaturePresent() constants (winnt.h)
+_PF_ARM_V8_INSTRUCTIONS_AVAILABLE = 29
+_PF_AVX_INSTRUCTIONS_AVAILABLE = 39
+_PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
+_PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41
+_PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE = 43
+
+
+def _win_cpu_registry():
+    """Return (brand string, vendor id) from the CentralProcessor registry key."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+        ) as k:
+            name = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+            try:
+                vendor = str(winreg.QueryValueEx(k, "VendorIdentifier")[0]).strip()
+            except OSError:
+                vendor = ""
+            return name, vendor
+    except Exception:
+        return "", ""
+
+
+def _win_processor_records():
+    """Raw SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records as (relationship, bytes)."""
+    try:
+        fn = ctypes.WinDLL("kernel32", use_last_error=True).GetLogicalProcessorInformationEx
+        fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        fn.restype = ctypes.c_int
+        size = ctypes.c_uint32(0)
+        fn(_WIN_RELATION_ALL, None, ctypes.byref(size))
+        if size.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if not fn(_WIN_RELATION_ALL, buf, ctypes.byref(size)):
+            return []
+        raw = buf.raw[: size.value]
+    except Exception:
+        return []
+    recs = []
+    off = 0
+    while off + 8 <= len(raw):
+        rel, rec_size = struct.unpack_from("<II", raw, off)
+        if rec_size < 8:
+            break
+        recs.append((rel, raw[off : off + rec_size]))
+        off += rec_size
+    return recs
+
+
+def _win_group_mask_cpus(rec, offset, count):
+    """Decode a GROUP_AFFINITY[count] array into global logical CPU indices."""
+    ptr = struct.calcsize("P")  # KAFFINITY is pointer-sized
+    bits = ptr * 8
+    cpus = []
+    for i in range(max(1, count)):
+        base = offset + i * (ptr + 8)  # KAFFINITY Mask; WORD Group; WORD Reserved[3]
+        if base + ptr + 2 > len(rec):
+            break
+        mask = int.from_bytes(rec[base : base + ptr], "little")
+        group = struct.unpack_from("<H", rec, base + ptr)[0]
+        cpus.extend(group * bits + b for b in range(bits) if (mask >> b) & 1)
+    return cpus
+
+
+def _win_max_mhz():
+    """Per-logical-CPU MaxMhz via CallNtPowerInformation(ProcessorInformation)."""
+
+    class _PPI(ctypes.Structure):
+        _fields_ = [
+            ("Number", ctypes.c_ulong),
+            ("MaxMhz", ctypes.c_ulong),
+            ("CurrentMhz", ctypes.c_ulong),
+            ("MhzLimit", ctypes.c_ulong),
+            ("MaxIdleState", ctypes.c_ulong),
+            ("CurrentIdleState", ctypes.c_ulong),
+        ]
+
+    try:
+        n = os.cpu_count() or 1
+        arr = (_PPI * n)()
+        status = ctypes.WinDLL("powrprof").CallNtPowerInformation(11, None, 0, arr, ctypes.sizeof(arr))
+        if status != 0:
+            return {}
+        return {int(p.Number): int(p.MaxMhz) for p in arr if p.MaxMhz > 0}
+    except Exception:
+        return {}
+
+
+def _win_hybrid_effective_cores(cores, is_intel):
+    """
+    Windows analogue of estimate_hybrid_effective_cores(): cores is a list of
+    (first_logical_cpu, EfficiencyClass). Windows marks P-cores with the highest
+    EfficiencyClass; lower classes get the clock ratio and (on Intel) the same
+    0.60 E-core vector-width factor used by the Linux path.
+    """
+    n = float(len(cores) or 1)
+    classes = {e for _, e in cores}
+    if len(classes) <= 1:
+        return n, n, n, False
+    top = max(classes)
+    mhz = _win_max_mhz()
+    freqs = [mhz.get(c) for c, _ in cores]
+    max_f = float(max(freqs)) if all(freqs) else 0.0
+    weights = []
+    for (c, eff), f in zip(cores, freqs):
+        clk = (f / max_f) if max_f > 0 else 1.0
+        vec = 0.60 if (is_intel and eff < top) else 1.0
+        weights.append(clk * vec)
+    dyn_c, stat_c = sum(weights), len(weights) * min(weights)
+    return stat_c, dyn_c, 0.50 * stat_c + 0.50 * dyn_c, True
+
+
+def _win_cpu_flags(vendor, arch):
+    flags = set()
+    try:
+        present = ctypes.windll.kernel32.IsProcessorFeaturePresent
+    except Exception:
+        return flags
+    if arch.upper() in ("ARM64", "AARCH64"):
+        if present(_PF_ARM_V8_INSTRUCTIONS_AVAILABLE):
+            flags.update(["neon", "asimd"])
+        if present(_PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE):
+            flags.add("asimddp")
+        return flags
+    if present(_PF_AVX_INSTRUCTIONS_AVAILABLE):
+        flags.add("avx")
+    if present(_PF_AVX2_INSTRUCTIONS_AVAILABLE):
+        flags.add("avx2")
+    if present(_PF_AVX512F_INSTRUCTIONS_AVAILABLE):
+        flags.add("avx512f")
+        # Windows exposes no feature bit for VNNI/BF16/VBMI. Every AMD core with
+        # AVX-512 (Zen 4, Zen 5) implements all three; on Intel we stay conservative.
+        if vendor == "AuthenticAMD":
+            flags.update(["avx512_vnni", "avx512_bf16", "avx512_vbmi"])
+    return flags
+
+
+def _detect_windows_cpu(info):
+    name, vendor = _win_cpu_registry()
+    if name:
+        info["model_name"] = name
+    info["flags"].update(_win_cpu_flags(vendor, info["arch"]))
+
+    recs = _win_processor_records()
+    cores = []  # (first logical cpu, efficiency class)
+    logical = set()
+    packages = numa = 0
+    l3_bytes = 0
+    l3_instances = 0
+    for rel, rec in recs:
+        if rel == _WIN_RELATION_PROCESSOR_CORE and len(rec) >= 32:
+            eff = rec[9]
+            group_count = struct.unpack_from("<H", rec, 30)[0]
+            cpus = _win_group_mask_cpus(rec, 32, group_count)
+            if cpus:
+                cores.append((min(cpus), eff))
+                logical.update(cpus)
+        elif rel == _WIN_RELATION_PROCESSOR_PACKAGE:
+            packages += 1
+        elif rel == _WIN_RELATION_NUMA_NODE:
+            numa += 1
+        elif rel == _WIN_RELATION_CACHE and len(rec) >= 20:
+            level = rec[8]
+            cache_size = struct.unpack_from("<I", rec, 12)[0]
+            cache_type = struct.unpack_from("<i", rec, 16)[0]  # 0=Unified, 1=Instruction, 2=Data
+            if level == 3 and cache_type in (0, 2):
+                l3_bytes += cache_size
+                l3_instances += 1
+
+    if cores:
+        cores.sort()
+        info["physical_core_ids"] = [c for c, _ in cores]
+        info["physical_cores"] = len(cores)
+        info["logical_threads"] = len(logical)
+        stat_c, dyn_c, blend_c, is_hyb = _win_hybrid_effective_cores(cores, vendor == "GenuineIntel")
+        info["is_hybrid"] = is_hyb
+        info["hybrid_static_cores"] = round(stat_c, 2)
+        info["hybrid_dynamic_cores"] = round(dyn_c, 2)
+        info["hybrid_blended_cores"] = round(blend_c, 2)
+    else:
+        info["physical_core_ids"] = list(range(info["physical_cores"]))
+    if packages:
+        info["sockets"] = packages
+    if numa:
+        info["numa_nodes"] = numa
+    if l3_bytes:
+        info["l3_total_mb"] = l3_bytes / (1024.0 * 1024.0)
+        info["l3_instances"] = l3_instances
+
+
+def _detect_windows_memory(mem):
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_uint32),
+            ("dwMemoryLoad", ctypes.c_uint32),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+
+    try:
+        st = _MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            mem["total_gb"] = st.ullTotalPhys / (1024.0 ** 3)
+            mem["available_gb"] = st.ullAvailPhys / (1024.0 ** 3)
+    except Exception:
+        pass
+    mem["thp_enabled"] = "n/a"
+    mem["thp_defrag"] = "n/a"
+
+
+def _bw_libc():
+    """C runtime exposing memset/memchr (glibc / libSystem on POSIX, msvcrt on Windows)."""
+    try:
+        if sys.platform == "win32":
+            return ctypes.CDLL("msvcrt")
+        name = ctypes.util.find_library("c")
+        return ctypes.CDLL(name) if name else None
+    except OSError:
+        return None
+
+
 def detect_cpu_and_cache():
     info = {
         "os": platform.system(),
@@ -335,6 +583,8 @@ def detect_cpu_and_cache():
         if info["arch"] == "arm64":
             info["flags"].update(["neon", "asimd", "dotprod", "apple_amx"])
         info["physical_core_ids"] = list(range(info["physical_cores"]))
+    elif info["os"] == "Windows":
+        _detect_windows_cpu(info)
     else:
         info["physical_core_ids"] = list(range(info["physical_cores"]))
 
@@ -412,6 +662,8 @@ def detect_memory_and_thp():
             mem["total_gb"] = int(tot) / (1024.0 ** 3)
             mem["available_gb"] = mem["total_gb"] * 0.75
         mem["thp_enabled"] = "macos_superpages"
+    elif platform.system() == "Windows":
+        _detect_windows_memory(mem)
 
     return mem
 
@@ -433,8 +685,7 @@ def _bw_pool_init(ready_val, start_evt):
 def _bw_worker(args):
     buf_mb, iters = args
     size = buf_mb * 1024 * 1024
-    libc_name = ctypes.util.find_library("c")
-    libc = ctypes.CDLL(libc_name) if libc_name else None
+    libc = _bw_libc()
 
     # Allocate anonymous mmap buffer and fault all pages in BEFORE barrier
     src = mmap.mmap(-1, size)
@@ -476,29 +727,31 @@ def measure_dram_bandwidth_gbs(physical_cores, total_ram_gb):
     iters = 6
 
     try:
-        if "fork" in multiprocessing.get_all_start_methods():
-            ctx = multiprocessing.get_context("fork")
-            ready = ctx.Value("i", 0)
-            evt = ctx.Event()
-            pool = ctx.Pool(processes=n_workers, initializer=_bw_pool_init, initargs=(ready, evt))
-            async_res = [pool.apply_async(_bw_worker, ((buf_mb, iters),)) for _ in range(n_workers)]
-            t_wait0 = time.perf_counter()
-            while ready.value < n_workers and (time.perf_counter() - t_wait0) < 4.0:
-                time.sleep(0.005)
-            t0 = time.perf_counter()
-            evt.set()
-            results = [r.get(timeout=10) for r in async_res]
-            wall_time = time.perf_counter() - t0
-            pool.close()
-            pool.join()
-        else:
-            ctx = multiprocessing.get_context("spawn")
-            pool = ctx.Pool(processes=n_workers)
-            t0 = time.perf_counter()
-            results = pool.map(_bw_worker, [(buf_mb, iters) for _ in range(n_workers)])
-            wall_time = time.perf_counter() - t0
-            pool.close()
-            pool.join()
+        # Both paths use the same ready-barrier so that interpreter start-up (slow under
+        # 'spawn', e.g. on Windows) and page-faulting are excluded from the timed window.
+        use_fork = "fork" in multiprocessing.get_all_start_methods()
+        if not use_fork:
+            # 'spawn' children re-import __main__ from disk. When the script is piped via
+            # stdin there is no file to import: workers crash and the Pool respawns them
+            # forever. Skip the benchmark (caller falls back to a default bandwidth).
+            main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+            if not main_file or not os.path.isfile(main_file):
+                return 0.0
+        ctx = multiprocessing.get_context("fork" if use_fork else "spawn")
+        ready_timeout = 4.0 if use_fork else 20.0
+        ready = ctx.Value("i", 0)
+        evt = ctx.Event()
+        pool = ctx.Pool(processes=n_workers, initializer=_bw_pool_init, initargs=(ready, evt))
+        async_res = [pool.apply_async(_bw_worker, ((buf_mb, iters),)) for _ in range(n_workers)]
+        t_wait0 = time.perf_counter()
+        while ready.value < n_workers and (time.perf_counter() - t_wait0) < ready_timeout:
+            time.sleep(0.005)
+        t0 = time.perf_counter()
+        evt.set()
+        results = [r.get(timeout=30) for r in async_res]
+        wall_time = time.perf_counter() - t0
+        pool.close()
+        pool.join()
 
         total_bytes = sum(b for b, _ in results)
         max_worker_time = max(t for _, t in results)
@@ -708,6 +961,14 @@ def main():
     parser.add_argument("--no-bench", action="store_true", help="Skip the 0.6s DRAM bandwidth micro-benchmark")
     args = parser.parse_args()
 
+    # Legacy Windows code pages (cp1252/cp437) cannot encode the report's bullets/arrows;
+    # degrade to '?' instead of crashing halfway through the report.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     cpu = detect_cpu_and_cache()
     mem = detect_memory_and_thp()
 
@@ -781,6 +1042,17 @@ def main():
         print(f"  git clone https://github.com/synchopate/llama-modchip.git && cd llama-modchip")
         print(f"  ./modchip setup     # builds native arm64 + Metal (Q4_0 & Fractal-64 Q2_0 shaders)")
         print(f"  ./modchip start && ./modchip bench")
+    elif cpu.get("os") == "Windows":
+        core_mask = sum(1 << c for c in cpu.get("physical_core_ids", [])) or 1
+        print(f"\n [4] RECOMMENDED LAUNCH FLAGS FOR THIS CPU (Windows / PowerShell)")
+        print(f"  One-click GPU+CPU launcher: windows\\AVVIA_MODCHIP.bat  (see windows\\README.md)")
+        print(f"  $env:LLAMA_MOE_TOP_K=4; $env:LLAMA_KV_L3_WINDOW=2048; $env:LLAMA_ATTN_WINDOW=4096; $env:LLAMA_ATTN_SINKS=16")
+        print(f"  $env:LLAMA_SWA_STRIDE=1; $env:LLAMA_KV_DISABLE_CHUNKING=1; $env:OMP_PROC_BIND='close'; $env:OMP_PLACES='cores'")
+        print(f"  llama-server.exe --model NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf `")
+        print(f"    -c 262144 -np 1 -t {cpu['physical_cores']} -tb {cpu['physical_cores']} -b 2048 -ub 2048 --cpu-mask 0x{core_mask:X} `")
+        print(f"    --cache-type-k q8_0 --cache-type-v q4_0 --repack --flash-attn auto --cache-reuse 256 --slot-save-path $env:TEMP `")
+        print(f"    --ctx-checkpoints 64 --checkpoint-min-step 128 `")
+        print(f"    --spec-type ngram-simple --spec-ngram-simple-size-n 4 --spec-ngram-simple-size-m 7 --spec-ngram-simple-min-hits 1")
     else:
         print(f"\n [4] RECOMMENDED LAUNCH FLAGS FOR THIS CPU (via llama_modchip.py)")
         print(f"  python3 scripts/llama_modchip.py --model /path/to/model.gguf --apply-shm --print-cmd")
@@ -832,6 +1104,22 @@ def main():
                 print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
                 print(f"      Ignore this if your RAM already runs at its rated speed.")
                 print(f"      (In Issue #17, decode scaled ~+45-50% from 2133 -> 3200 MT/s.)")
+    if (
+        cpu.get("os") == "Windows"
+        and cpu.get("arch", "").upper() in ("AMD64", "X86_64")
+        and cpu.get("sockets", 1) == 1
+        and bw_gbs > 0.0
+    ):
+        model_str = cpu.get("model_name", "")
+        is_mobile_sku = (not re.search(r"\b(EPYC|Xeon|Threadripper)\b", model_str, re.I)) and bool(
+            re.search(r"\b\d{3,5}(?:U|H|HS|HX|HX3D|P|G\d|V)\b", model_str) or re.search(r"\bRyzen AI\b", model_str, re.I)
+        )
+        if rep["measured_bw_gbs"] <= (25.0 if is_mobile_sku else 31.5):
+            print(f"\n  [i] Measured DRAM bandwidth is low ({rep['measured_bw_gbs']:.1f} GB/s).")
+            print(f"      Check that both memory channels are populated and RAM runs at its rated speed")
+            print(f"      (XMP/EXPO on desktops, AC power on laptops). In PowerShell:")
+            print(f"        Get-CimInstance Win32_PhysicalMemory | Format-Table BankLabel,Capacity,ConfiguredClockSpeed")
+            print(f"      A single listed module usually means single-channel operation (~half the bandwidth).")
     print("=" * 78)
 
 
