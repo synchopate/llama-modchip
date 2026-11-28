@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 *.so
 .modchip_workspace
+
+# Nix build symlinks (flake.nix)
+result
+result-*
